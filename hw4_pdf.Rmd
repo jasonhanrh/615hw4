@@ -1,0 +1,241 @@
+---
+title: "hw4_pdf"
+author: "Ruihang Han"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(data.table)
+library(lubridate)
+
+file_root <- "https://www.ndbc.noaa.gov/view_text_file.php?filename=44013h"
+years <- seq(1985, 2023)
+tail <- ".txt.gz&dir=data/historical/stdmet/"
+
+all_data <- list()
+
+for (year in years) {
+  path <- paste0(file_root, year, tail)
+  
+  # Read the first and second lines to determine how many lines to skip
+  header <- scan(path, what = 'character', nlines = 1, quiet = TRUE)
+  second_line <- scan(path, what = 'character', skip = 1, nlines = 1, quiet = TRUE)
+  skip_lines <- ifelse(any(grepl("[a-zA-Z]", second_line)), 2, 1)
+  
+  # Read the data
+  buoy <- fread(path, header = FALSE, skip = skip_lines, fill = TRUE)
+  
+  # Handle column names and ensure column numbers match
+  if (length(header) == ncol(buoy)) {
+    colnames(buoy) <- header
+  } else if (length(header) < ncol(buoy)) {
+    extra_cols <- paste0("V", (length(header) + 1):ncol(buoy))
+    colnames(buoy) <- c(header, extra_cols)
+  } else {
+    colnames(buoy) <- header[1:ncol(buoy)]
+  }
+  
+  year_col <- grep("^YY$|^YYYY$|^#YY$|^#YYYY$", colnames(buoy), ignore.case = TRUE)
+  if (length(year_col) > 0) {
+    setnames(buoy, year_col, "YYYY")
+    # If the original column is a two-digit year, convert it to four digits
+    if (max(buoy$YYYY, na.rm = TRUE) < 100) {
+      buoy[, YYYY := ifelse(YYYY < 50, YYYY + 2000, YYYY + 1900)]
+    }
+  } else {
+    # If no year column is found, add one
+    buoy[, YYYY := year]
+  }
+  
+  # Ensure month and day columns exist
+  if (!"MM" %in% colnames(buoy)) buoy[, MM := NA]
+  if (!"DD" %in% colnames(buoy)) buoy[, DD := NA]
+  
+  # Handle wind direction column (WD or WDIR)
+  if ("WD" %in% colnames(buoy) && !"WDIR" %in% colnames(buoy)) {
+    setnames(buoy, "WD", "WDIR")
+  } else if ("WDIR" %in% colnames(buoy) && "WD" %in% colnames(buoy)) {
+    buoy[, WDIR := ifelse(is.na(WDIR), WD, WDIR)]
+    buoy[, WD := NULL]
+  }
+  
+  # Handle pressure column (BAR or PRES)
+  if ("BAR" %in% colnames(buoy) && !"PRES" %in% colnames(buoy)) {
+    setnames(buoy, "BAR", "PRES")
+  } else if ("PRES" %in% colnames(buoy) && "BAR" %in% colnames(buoy)) {
+    buoy[, PRES := ifelse(is.na(PRES), BAR, PRES)]
+    buoy[, BAR := NULL]
+  } else if ("PRES" %in% colnames(buoy)) {
+    # PRES column already exists, no need to modify
+  } else if ("BAR" %in% colnames(buoy)) {
+    setnames(buoy, "BAR", "PRES")
+  }
+ 
+  # Store data for each year
+  all_data[[as.character(year)]] <- buoy
+}
+
+
+test_data <- rbindlist(all_data, use.names = TRUE, fill = TRUE)
+
+# Ensure YYYY, MM, DD columns are at the front
+setcolorder(test_data, c("YYYY", "MM", "DD"))
+
+
+test_data[, DATE := ymd(paste(YYYY, MM, DD, sep = "-"))]
+
+
+setcolorder(test_data, c("DATE", "YYYY", "MM", "DD"))
+
+
+head(test_data)
+
+```
+
+```{r}
+# List the columns that need to be checked for 999 values
+na_columns <- c("WDIR", "WSPD", "GST", "WVHT", "DPD", "APD", "MWD", 
+                "PRES", "ATMP", "WTMP", "DEWP", "VIS", "TIDE")
+
+# Handle missing values by replacing 999 with NA
+test_data[, (na_columns) := lapply(.SD, function(x) ifelse(x %in% c(99, 999), NA, x)), .SDcols = na_columns]
+
+# Check the distribution of NA values in each column
+na_summary <- test_data[, lapply(.SD, function(x) sum(is.na(x))), .SDcols = na_columns]
+print(na_summary)
+
+# Visualize the distribution of missing values
+library(ggplot2)
+library(reshape2)
+
+# Convert missing value summary into a format suitable for visualization
+na_melted <- melt(na_summary, variable.name = "Variable", value.name = "Missing_Count")
+ggplot(na_melted, aes(x = Variable, y = Missing_Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Missing Values per Variable", x = "Variable", y = "Missing Count")
+
+```
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+library(lubridate) 
+library(forecast)
+
+# Load data
+buoy_data <- test_data
+buoy_data$DATE <- as.Date(buoy_data$DATE, format = "%Y-%m-%d")
+
+# Clean data: Remove rows with missing air temperature (ATMP)
+buoy_data_clean <- buoy_data %>%
+  filter(!is.na(ATMP))
+
+# Create a season column
+buoy_data_clean <- buoy_data_clean %>%
+  mutate(season = case_when(
+    month(DATE) %in% c(3, 4, 5)  ~ "Spring",
+    month(DATE) %in% c(6, 7, 8)  ~ "Summer",
+    month(DATE) %in% c(9, 10, 11) ~ "Autumn",
+    month(DATE) %in% c(12, 1, 2) ~ "Winter"
+  ))
+
+# Calculate the average air temperature for each season
+seasonal_avg <- buoy_data_clean %>%
+  group_by(season) %>%
+  summarise(mean_temp = mean(ATMP, na.rm = TRUE),
+            sd_temp = sd(ATMP, na.rm = TRUE))
+
+# Print the average air temperature for each season
+print(seasonal_avg)
+
+# Plot the distribution of air temperature for each season (boxplot)
+ggplot(buoy_data_clean, aes(x = season, y = ATMP, fill = season)) +
+  geom_boxplot() +
+  labs(title = "Air Temperature Distribution by Season", x = "Season", y = "Temperature (°C)") +
+  theme_minimal()
+
+# Plot the trend of air temperature changes for each season
+ggplot(buoy_data_clean, aes(x = DATE, y = ATMP, color = season)) +
+  geom_line() +
+  facet_wrap(~ season) + # Plot by season
+  labs(title = "Air Temperature Trend for Each Season", x = "Date", y = "Temperature (°C)") +
+  theme_minimal()
+
+```
+
+This analysis reveals significant differences in temperature distribution across seasons. Summer exhibits the highest temperatures, ranging from 15°C to 30°C, while winter shows the lowest, between -10°C and 10°C. Spring and autumn serve as transitional seasons with broader temperature variations, with spring generally being cooler than autumn. The long-term trend analysis indicates clear seasonal cyclic patterns: summer temperatures are relatively stable, while winter shows more significant fluctuations, with some years displaying extreme low temperatures. Although there is no strong evidence of a clear long-term warming trend, certain anomalous fluctuations, particularly in spring and winter, could be indicative of climate change effects, such as more frequent extreme weather events.
+
+This analysis suggests that further investigation is needed, especially through fitting seasonal time-series models like ARIMA, to explore any long-term temperature trends. Additionally, a comparative study of average temperatures across different periods could help determine whether climate change has led to shifts in seasonal temperature distributions, such as more frequent extreme heat in summer or increased extreme cold events in winter.
+
+```{r}
+# Load necessary R packages
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+
+# 1. Load data
+buoy_data <- test_data  # Ensure test_data is properly loaded
+rainfall_data <- read.csv("Rainfall.csv")
+
+# 2. Use lubridate to process dates
+# Convert the DATE column in the rainfall data to a date format
+rainfall_data <- rainfall_data %>%
+  mutate(date_only = ymd_hm(DATE))  # Ensure the DATE column format is compatible with ymd_hm
+
+# Convert year, month, day, and hour columns in buoy data to a datetime format
+buoy_data$date_only <- ymd_h(paste(buoy_data$YYYY, buoy_data$MM, buoy_data$DD, buoy_data$hh, sep='-'))
+
+# 3. Merge data and remove unnecessary columns
+rain_subset <- rainfall_data[,c("date_only", "HPCP")]
+rain_subset <- rain_subset %>%
+  left_join(select(buoy_data, date_only, WSPD), by = "date_only")
+
+# Remove rows with missing values
+rain_subset <- na.omit(rain_subset)
+
+# 4. Build a linear regression model to analyze the relationship between rainfall (HPCP) and wind speed (WSPD)
+model <- lm(HPCP ~ WSPD, data = rain_subset)
+
+# 5. View the model summary
+summary(model)
+
+# 6. Predict rainfall and add the predicted values to the data frame
+rain_subset <- rain_subset %>%
+  mutate(predicted_rainfall = predict(model, .))
+
+# 7. Plot actual rainfall and predicted rainfall comparison
+ggplot(rain_subset, aes(x = date_only)) +
+  geom_line(aes(y = HPCP), color = "blue", linewidth = 1) +  # Actual rainfall
+  geom_line(aes(y = predicted_rainfall), color = "red", linetype = "dashed", linewidth = 1) +  # Predicted rainfall
+  labs(title = "Comparison of Actual and Predicted Rainfall", x = "Date", y = "Rainfall (inches)") +
+  theme_minimal()
+
+# Scatter plot of Rainfall (HPCP) vs Wind Speed (WSPD)
+ggplot(rain_subset, aes(x = WSPD, y = HPCP)) +
+  geom_point(color = "blue", alpha = 0.5) +  # Plot scatter points
+  geom_smooth(method = "lm", color = "red", se = FALSE) +  # Add regression line, no confidence interval
+  labs(title = "Scatter Plot of Rainfall (HPCP) vs Wind Speed (WSPD)", 
+       x = "Wind Speed (WSPD)", 
+       y = "Rainfall (HPCP, inches)") +
+  theme_minimal()
+
+
+
+```
+
+The first image shows a time-series plot comparing actual rainfall (in blue) and predicted rainfall (in red) over time. The predicted rainfall remains quite flat and does not capture the variability or peaks in the actual rainfall. This suggests that the linear regression model, which predicts rainfall based on wind speed (WSPD), does not accurately capture the relationship between the two variables.
+
+The second image shows the output of the linear regression model. The coefficient for wind speed (WSPD) is positive and statistically significant (p-value \< 2.2e-16), indicating that there is a relationship between wind speed and rainfall. However, the R-squared value is extremely low (0.0025), suggesting that wind speed explains only a small portion of the variance in rainfall. The model's predictive power is weak, as indicated by the low adjusted R-squared, meaning that wind speed is not a strong predictor of rainfall in this case.
+
+In summary, while wind speed has a statistically significant relationship with rainfall, it explains very little of the variation, and the model does not predict rainfall effectively based on this single factor.
